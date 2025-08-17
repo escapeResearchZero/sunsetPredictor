@@ -1,0 +1,36 @@
+---
+const { title } = Astro.props;
+---
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+  </head>
+  <body class="min-h-screen bg-gray-50 text-gray-900">
+    <!-- 顶部导航栏 -->
+    <header class="bg-white shadow-sm">
+      <div class="mx-auto max-w-screen-2xl px-4 py-3 flex items-center justify-between">
+        <!-- 左边标题 -->
+        <a href="/" class="text-lg font-bold text-orange-600 hover:text-orange-700">
+          Sunset Predictor
+        </a>
+        <!-- 右边导航链接 -->
+        <nav class="flex gap-6 text-sm">
+          <a href="/" class="hover:text-orange-600">首页 / Home</a>
+          <a href="/scoring" class="hover:text-orange-600">打分系统 / Scoring</a>
+        </nav>
+      </div>
+    </header>
+
+    <!-- 页面内容 -->
+    <main class="mx-auto max-w-screen-2xl px-4 py-8">
+      <slot />
+    </main>
+
+    <footer class="mt-12 border-t py-6 text-center text-sm text-gray-500">
+      数据来源：Open-Meteo · 火烧云预测仅供参考
+    </footer>
+  </body>
+</html>
+

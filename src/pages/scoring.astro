@@ -1,0 +1,184 @@
+---
+import Layout from "../layouts/Layout.astro";
+import { Card, CardHeader, CardTitle, CardContent } from "../components/ui/card";
+---
+
+<Layout title="Scoring System | Sunset Predictor">
+  <div class="container mx-auto px-4 py-8 space-y-8">
+    <div>
+      <h1 class="text-3xl font-bold text-gray-900 mb-2">🌇 Scoring System / 打分系统</h1>
+      <p class="text-gray-700 text-sm leading-relaxed">
+        本工具的“日落/火烧云指数”是一个启发式（heuristic）的加权评分（0–100）。我们先在「日落前后 ±窗口」内汇总气象要素（平均/最小/最大），
+        再把各要素标准化到 0–1 之间（得到 <code>s</code>），与权重 <code>w</code> 相乘求和，最后×100 得出总分。<br/>
+        The "Sunset Score" is a heuristic weighted score (0–100). We aggregate weather variables in a ±window around sunset,
+        normalize each factor to [0–1] as <code>s</code>, weight them by <code>w</code>, sum them, then ×100.
+      </p>
+    </div>
+
+    <!-- Pipeline -->
+    <Card>
+      <CardHeader>
+        <CardTitle>🧭 Pipeline / 处理流程</CardTitle>
+      </CardHeader>
+      <CardContent class="text-sm text-gray-800 space-y-3">
+        <ol class="list-decimal pl-5 space-y-2">
+          <li>
+            <b>取数 / Data</b>：从 Open-Meteo 获取逐小时的
+            <code>cloudcover[_low/_mid/_high]</code>、<code>precipitation_probability</code>、
+            <code>visibility</code>、<code>wind_speed_10m</code>。
+          </li>
+          <li>
+            <b>时间窗 / Window</b>：以天文计算的日落时间为中心，取 ±<i>window</i> 分钟的小时索引集合（默认 ±90 分）。
+          </li>
+          <li>
+            <b>聚合 / Aggregate</b>：对窗口内各要素求 <b>平均</b>（并保留 min / max 供展示）。
+          </li>
+          <li>
+            <b>标准化 / Normalize</b>：把每个聚合后的要素转换到 <b>[0,1]</b> 得分 <code>s</code>（见下文“标准化函数”）。
+          </li>
+          <li>
+            <b>加权求和 / Weighted sum</b>：<code>Score = 100 × Σ ( w<sub>i</sub> × s<sub>i</sub> )</code>。
+          </li>
+          <li>
+            <b>分级标签 / Label</b>：基于总分给出 “🔥 Fire / Great / Good / Fair / Poor”。
+          </li>
+        </ol>
+        <p class="text-xs text-gray-500">
+          注：如果有的要素缺失，我们使用中性值（如 0.5 或 0.6）并在详情中标注“无数据”（No data）。
+        </p>
+      </CardContent>
+    </Card>
+
+    <!-- Normalization -->
+    <Card>
+      <CardHeader>
+        <CardTitle>📐 Normalization / 标准化函数</CardTitle>
+      </CardHeader>
+      <CardContent class="text-sm text-gray-800 space-y-4">
+        <div>
+          <b>1) 三角函数 tri</b>：
+          <pre class="bg-gray-50 p-3 rounded-md border overflow-x-auto text-xs">
+tri(x, m, w) = clamp( 1 - |x - m| / w , 0 , 1 )
+/*
+  m: 理想值（optimal value），w: 可容忍宽度（tolerance）
+  当 x=m 得 1；偏离 m 在 w 内线性下降到 0；超出 w 为 0
+*/</pre>
+          用途：高云（m=50, w=40）、中云（m=40, w=35）、风速（m=4 m/s, w=4）。
+        </div>
+
+        <div>
+          <b>2) 低云（越少越好）</b>：
+          <pre class="bg-gray-50 p-3 rounded-md border overflow-x-auto text-xs">
+s_low = 1 - tri( lowCloudPct , 20 , 25 )
+/* 约 0–20% 更利于地平线通透，因此低云越多扣分越高 */</pre>
+        </div>
+
+        <div>
+          <b>3) 降水概率（越小越好）</b>：
+          <pre class="bg-gray-50 p-3 rounded-md border overflow-x-auto text-xs">
+s_precip = 1 - clamp( precipProb / 100 , 0 , 1 )</pre>
+        </div>
+
+        <div>
+          <b>4) 能见度（越大越好）</b>：
+          <pre class="bg-gray-50 p-3 rounded-md border overflow-x-auto text-xs">
+s_vis = clamp( ( visKm - 5 ) / 10 , 0 , 1 )
+/* 5 km 及以下趋近 0；15 km 及以上趋近 1；中间线性过渡 */</pre>
+        </div>
+
+        <div>
+          <b>5) 气溶胶（占位）</b>：
+          <pre class="bg-gray-50 p-3 rounded-md border overflow-x-auto text-xs">
+s_aod = 0.6  // 尚未接入 AOD/PM2.5 数据时的中性值</pre>
+        </div>
+
+        <div class="text-xs text-gray-500">
+          百分比数据兼容 0–1/0–100 两种来源：若检测到最大值 ≤ 1.01，则×100 归一到百分比。
+        </div>
+      </CardContent>
+    </Card>
+
+    <!-- Weights -->
+    <Card>
+      <CardHeader>
+        <CardTitle>⚖️ Weights / 权重</CardTitle>
+      </CardHeader>
+      <CardContent class="text-sm text-gray-800">
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-left text-sm">
+            <thead>
+              <tr class="text-gray-500">
+                <th class="py-2 pr-6">Factor / 因子</th>
+                <th class="py-2 pr-6">Weight w</th>
+                <th class="py-2">Rationale / 理由</th>
+              </tr>
+            </thead>
+            <tbody class="border-t">
+              <tr><td class="py-2 pr-6">High cloud / 高云</td><td class="py-2 pr-6">0.35</td><td class="py-2">高层卷云是色彩“画布”，适中覆盖最佳。</td></tr>
+              <tr><td class="py-2 pr-6">Mid cloud / 中云</td><td class="py-2 pr-6">0.25</td><td class="py-2">增强层次与纹理，过多会遮光。</td></tr>
+              <tr><td class="py-2 pr-6">Low cloud / 低云</td><td class="py-2 pr-6">0.15</td><td class="py-2">过厚会挡住地平线，少量可反射。</td></tr>
+              <tr><td class="py-2 pr-6">Precipitation / 降水概率</td><td class="py-2 pr-6">0.10</td><td class="py-2">降水越少越利于观测与拍摄。</td></tr>
+              <tr><td class="py-2 pr-6">Visibility / 能见度</td><td class="py-2 pr-6">0.07</td><td class="py-2">高能见度有助于颜色纯净与远景层次。</td></tr>
+              <tr><td class="py-2 pr-6">Wind / 风速</td><td class="py-2 pr-6">0.08</td><td class="py-2">适中风速利于云形态；过强会吹散。</td></tr>
+              <tr><td class="py-2 pr-6">Aerosol / 气溶胶</td><td class="py-2 pr-6">0.00</td><td class="py-2">暂未接入数据，默认不计。</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-xs text-gray-500 mt-3">
+          权重可在首页的“权重调整/Weight”区域（若开启）进行微调；不同地区/季节可尝试略作差异化。
+        </p>
+      </CardContent>
+    </Card>
+
+    <!-- Final formula -->
+    <Card>
+      <CardHeader>
+        <CardTitle>🧮 Final Score / 最终公式</CardTitle>
+      </CardHeader>
+      <CardContent class="text-sm text-gray-800 space-y-2">
+        <pre class="bg-gray-50 p-3 rounded-md border overflow-x-auto text-xs">
+Score = 100 × Σ ( w_i × s_i )
+where s_i ∈ [0, 1],  w_i ≥ 0</pre>
+        <p class="text-xs text-gray-500">
+          等级阈值（可调整）：≥85 Fire、≥70 Great、≥55 Good、≥40 Fair、否则 Poor。
+        </p>
+      </CardContent>
+    </Card>
+
+    <!-- Worked Example -->
+    <Card>
+      <CardHeader>
+        <CardTitle>🔎 Worked Example / 计算示例</CardTitle>
+      </CardHeader>
+      <CardContent class="text-sm text-gray-800 space-y-3">
+        <p>假设窗口平均：高云 58%，中云 35%，低云 12%，降水概率 20%，能见度 12 km，风速 5 m/s。</p>
+        <div class="overflow-x-auto">
+          <table class="min-w-full text-left text-xs">
+            <thead>
+              <tr class="text-gray-500">
+                <th class="py-1 pr-3">Factor</th>
+                <th class="py-1 pr-3">Formula</th>
+                <th class="py-1 pr-3">s</th>
+                <th class="py-1 pr-3">w</th>
+                <th class="py-1 pr-3">Contribution (=w×s×100)</th>
+              </tr>
+            </thead>
+            <tbody class="border-t">
+              <tr><td class="py-1 pr-3">High</td><td class="py-1 pr-3">tri(58, 50, 40)</td><td class="py-1 pr-3">0.80</td><td class="py-1 pr-3">0.35</td><td class="py-1 pr-3">28.0</td></tr>
+              <tr><td class="py-1 pr-3">Mid</td><td class="py-1 pr-3">tri(35, 40, 35)</td><td class="py-1 pr-3">0.86</td><td class="py-1 pr-3">0.25</td><td class="py-1 pr-3">21.5</td></tr>
+              <tr><td class="py-1 pr-3">Low</td><td class="py-1 pr-3">1 - tri(12, 20, 25)</td><td class="py-1 pr-3">0.52</td><td class="py-1 pr-3">0.15</td><td class="py-1 pr-3">7.8</td></tr>
+              <tr><td class="py-1 pr-3">Precip</td><td class="py-1 pr-3">1 - 0.20</td><td class="py-1 pr-3">0.80</td><td class="py-1 pr-3">0.10</td><td class="py-1 pr-3">8.0</td></tr>
+              <tr><td class="py-1 pr-3">Vis</td><td class="py-1 pr-3">clamp((12-5)/10)</td><td class="py-1 pr-3">0.70</td><td class="py-1 pr-3">0.07</td><td class="py-1 pr-3">4.9</td></tr>
+              <tr><td class="py-1 pr-3">Wind</td><td class="py-1 pr-3">tri(5, 4, 4)</td><td class="py-1 pr-3">0.75</td><td class="py-1 pr-3">0.08</td><td class="py-1 pr-3">6.0</td></tr>
+              <tr class="border-t font-medium"><td class="py-1 pr-3">Total</td><td class="py-1 pr-3">—</td><td class="py-1 pr-3">—</td><td class="py-1 pr-3">—</td><td class="py-1 pr-3">76.2 ≈ 76</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="text-xs text-gray-500">
+          以上仅为示例，实际数值以你的地点和时段的窗口平均为准。缺失数据将使用中性值（如 s=0.5/0.6）并在详情里注明。
+        </p>
+      </CardContent>
+    </Card>
+  </div>
+</Layout>
+
