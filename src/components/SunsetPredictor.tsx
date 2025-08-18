@@ -79,6 +79,8 @@ function aggNumOverIndices(source:(number|undefined)[], idx:number[], map?:(n:nu
 export default function SunsetPredictor(){
   const [lat,setLat] = useState<number|null>(null);
   const [lon,setLon] = useState<number|null>(null);
+  const [place,setPlace] = useState<string|null>(null);
+
   const [loading,setLoading] = useState(false);
   const [data,setData] = useState<OpenMeteoResponse|null>(null);
   const [tz,setTz] = useState<string|null>(null);
@@ -86,66 +88,58 @@ export default function SunsetPredictor(){
   const [weights] = useState<Weights>(defaultWeights);
   const [status,setStatus] = useState("");
   const [windowMinutes,setWindowMinutes] = useState(90);
-  const [place,setPlace] = useState<string>("");
   const [openDetail, setOpenDetail] = useState<number|null>(null);
 
-  // Geolocate (初次加载；失败则默认到 Lausanne，并尝试反查英文地名)
-  useEffect(()=>{
-    if(navigator.geolocation){
+  const canQuery = lat!=null && lon!=null;
+
+  // ---- Reverse geocode (EN) & setPlace ----
+  async function fetchPlaceName(la:number, lo:number){
+    try{
+      const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${la}&longitude=${lo}&localityLanguage=en`;
+      const res = await fetch(url);
+      if(!res.ok) throw new Error(`HTTP ${res.status}`);
+      const j = await res.json();
+      const name = j.city || j.locality || j.principalSubdivision || j.countryName || `${la.toFixed(4)}, ${lo.toFixed(4)}`;
+      setPlace(String(name));
+    }catch{
+      setPlace(`${la.toFixed(4)}, ${lo.toFixed(4)}`);
+    }
+  }
+
+  // ---- Geolocate once on mount (fallback Lausanne) ----
+  function requestLocation(){
+    if (navigator.geolocation){
       navigator.geolocation.getCurrentPosition(
         (p)=>{
-          setLat(p.coords.latitude);
-          setLon(p.coords.longitude);
-          fetchPlaceName(p.coords.latitude, p.coords.longitude);
-        },
-        ()=>{
-          const la = 46.5197, lo = 6.6323;
+          const la = +p.coords.latitude.toFixed(5);
+          const lo = +p.coords.longitude.toFixed(5);
           setLat(la); setLon(lo);
           fetchPlaceName(la, lo);
-        }
+        },
+        ()=>{
+          const la = 46.5197, lo = 6.6323; // Lausanne fallback
+          setLat(la); setLon(lo);
+          fetchPlaceName(la, lo);
+        },
+        { enableHighAccuracy:true, timeout:12000, maximumAge:0 }
       );
-    } else {
+    }else{
       const la = 46.5197, lo = 6.6323;
       setLat(la); setLon(lo);
       fetchPlaceName(la, lo);
     }
-  },[]);
+  }
+  useEffect(()=>{ requestLocation(); },[]);
 
-  // 经纬度改变时，轻微防抖后查询英文地名；失败时用 "lat, lon" 兜底
+  // If user edits lat/lon manually, refresh place name (debounced)
   useEffect(()=>{
     if(lat==null||lon==null) return;
-    const id=setTimeout(()=>fetchPlaceName(lat,lon),300);
+    const id = setTimeout(()=>{ fetchPlaceName(lat, lon); }, 300);
     return ()=>clearTimeout(id);
   },[lat,lon]);
 
-  async function fetchPlaceName(lat: number, lon: number): Promise<string> {
-  try {
-    const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`;
-    const res = await fetch(url);
-    if (!res.ok) throw new Error("Network response was not ok");
-    const data = await res.json();
-
-    // 优先用 city / locality，没有就回退到 subdivision / country
-    const place =
-      data.city ||
-      data.locality ||
-      data.principalSubdivision ||
-      data.countryName;
-
-    if (place) {
-      return place;
-    } else {
-      // 如果什么都没有，就返回坐标
-      return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-    }
-  } catch (err) {
-    console.error("Reverse geocoding failed:", err);
-    return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-  }
-}
-
   async function fetchForecast(){
-    if(lat==null||lon==null) return;
+    if(!canQuery) return;
     setLoading(true); setStatus("Fetching forecast / 获取天气数据…");
     try{
       const params = new URLSearchParams({
@@ -163,16 +157,16 @@ export default function SunsetPredictor(){
     }catch(e:any){ console.error(e); setStatus(e?.message||"Failed to load forecast / 加载失败"); }
     finally{ setLoading(false); }
   }
-  useEffect(()=>{ if(lat!=null&&lon!=null) fetchForecast(); },[lat,lon,days]);
+  useEffect(()=>{ if(canQuery) fetchForecast(); },[lat,lon,days]);
 
   const sunsets = useMemo<SunsetItem[]>(()=>{
-    if(!data||lat==null||lon==null) return [];
+    if(!data||!canQuery) return [];
     const t = data.hourly.time.map(s=>new Date(s));
     const out:SunsetItem[]=[]; const today=new Date();
 
     for(let d=0; d<days; d++){
       const day=new Date(today); day.setDate(today.getDate()+d);
-      const sunset = SunCalc.getTimes(day, lat, lon).sunset;
+      const sunset = SunCalc.getTimes(day, lat!, lon!).sunset;
       const windowStart = new Date(sunset.getTime() - windowMinutes*60*1000);
       const windowEnd   = new Date(sunset.getTime() + windowMinutes*60*1000);
 
@@ -191,13 +185,13 @@ export default function SunsetPredictor(){
       const pPrecip=aggPrecip.avg, visKm=aggVisKm.avg, wind=aggWind.avg;
 
       // === 标准化得分 s_i（0–1） ===
-      const sHigh = ccHigh==null?0.5:tri(ccHigh,50,40);     // 高云 ~50% 最优
-      const sMid  = ccMid==null?0.5:tri(ccMid,40,35);       // 中云 ~40% 最优
-      const sLow  = ccLow==null?0.5:1 - tri(ccLow,20,25);   // 低云越少越好
-      const sPre  = pPrecip==null?0.6:1 - clamp(pPrecip/100,0,1); // 降水越少越好
-      const sVis  = visKm==null?0.6:clamp((visKm-5)/10,0,1);      // 5→15km 线性加分
-      const sWind = wind==null?0.6:tri(wind,4,4);                 // ~4 m/s 最优
-      const sAod  = 0.6; // 预留
+      const sHigh = ccHigh==null?0.5:tri(ccHigh,50,40);
+      const sMid  = ccMid==null?0.5:tri(ccMid,40,35);
+      const sLow  = ccLow==null?0.5:1 - tri(ccLow,20,25);
+      const sPre  = pPrecip==null?0.6:1 - clamp(pPrecip/100,0,1);
+      const sVis  = visKm==null?0.6:clamp((visKm-5)/10,0,1);
+      const sWind = wind==null?0.6:tri(wind,4,4);
+      const sAod  = 0.6;
 
       const w=weights;
       const parts = [
@@ -208,7 +202,7 @@ export default function SunsetPredictor(){
         { key:"vis",  label:"Visibility / 能见度",         s:sVis,  w:w.visibility, note: visKm==null  ? "No data / 无数据" : undefined },
         { key:"wind", label:"Wind / 风速",                 s:sWind, w:w.wind,       note: wind==null   ? "No data / 无数据" : undefined },
         { key:"aod",  label:"Aerosol / 气溶胶(占位)",      s:sAod,  w:w.aerosol,    note: "Not wired yet / 暂未接入" },
-      ].map(it => ({ ...it, contribution: Math.round(it.s * it.w * 1000)/10 })); // 保留 0.1
+      ].map(it => ({ ...it, contribution: Math.round(it.s * it.w * 1000)/10 }));
 
       const score0 = parts.reduce((acc,it)=>acc+it.contribution,0);
       const score = Math.round(clamp(score0,0,100));
@@ -224,8 +218,6 @@ export default function SunsetPredictor(){
     return out;
   },[data,lat,lon,days,weights,windowMinutes]);
 
-  const canQuery = lat!=null && lon!=null;
-
   return (
     <div className="container mx-auto px-4">
       {/* 标题 */}
@@ -240,6 +232,17 @@ export default function SunsetPredictor(){
       {/* 控制面板 */}
       <Card className="mb-6 shadow-lg rounded-2xl">
         <CardContent className="p-4 md:p-6 grid gap-4">
+          {/* 顶部：自动定位提示 + 重新定位按钮 */}
+          <div className="flex items-center justify-between text-sm text-gray-600">
+            <div>
+              位置 / Location：{place ?? (lat!=null && lon!=null ? `${lat.toFixed(5)}, ${lon.toFixed(5)}` : "—")}
+            </div>
+            <Button onClick={requestLocation} variant="secondary" className="gap-2">
+              <LocateFixed className="w-4 h-4"/> 重新定位
+            </Button>
+          </div>
+
+          {/* 手动输入 + 拉取按钮 */}
           <div className="grid md:grid-cols-3 gap-3 items-end">
             <div>
               <label className="text-sm text-gray-600">Latitude / 纬度</label>
@@ -250,10 +253,7 @@ export default function SunsetPredictor(){
               <Input type="number" step="0.0001" value={lon ?? ''} onChange={(e)=>setLon(parseFloat(e.target.value))}/>
             </div>
             <div className="flex gap-2">
-              <Button onClick={()=>navigator.geolocation?.getCurrentPosition((p)=>{ setLat(p.coords.latitude); setLon(p.coords.longitude); fetchPlaceName(p.coords.latitude, p.coords.longitude); })} variant="secondary" className="gap-2">
-                <LocateFixed className="w-4 h-4"/> 定位
-              </Button>
-              <Button onClick={fetchForecast} disabled={!canQuery || loading} className="gap-2">
+              <Button onClick={fetchForecast} disabled={! (lat!=null && lon!=null) || loading} className="gap-2">
                 {loading ? (<><Loader2 className="w-4 h-4 animate-spin"/> 加载…</>) : (<>获取预报</>)}
               </Button>
             </div>
@@ -269,21 +269,13 @@ export default function SunsetPredictor(){
               <Slider value={[windowMinutes]} min={30} max={150} step={15} onValueChange={(v)=>setWindowMinutes(v[0])}/>
             </div>
             <div className="p-3 rounded-2xl bg-white shadow-sm text-sm text-gray-600 flex flex-col gap-1 col-span-full">
-              <div className="flex items-center gap-2"><Info className="w-4 h-4"/>{status || (tz ? `时区 / Timezone：${tz}` : "准备就绪 / Ready")}</div>
-              <div className="pl-6">
-                位置 / Location：
-                {place
-                  ? place
-                  : (lat!=null && lon!=null)
-                    ? `${lat.toFixed(5)}, ${lon.toFixed(5)}`
-                    : "—（未知 / Unknown）"}
-              </div>
+              <div className="flex items-center gap-2"><Info className="w-4 h-4"/>{(tz && `时区 / Timezone：${tz}`) || "准备就绪 / Ready"}</div>
             </div>
           </div>
         </CardContent>
       </Card>
 
-      {!data && (<div className="text-sm text-gray-700 flex items-center gap-2"><Cloud className="w-4 h-4"/> 输入坐标并点击「获取预报」。</div>)}
+      {!data && (<div className="text-sm text-gray-700 flex items-center gap-2"><Cloud className="w-4 h-4"/> 自动或手动设置坐标后点击「获取预报」。</div>)}
 
       <div className="grid gap-6 sm:grid-cols-1 lg:grid-cols-2 xl:grid-cols-3">
         {sunsets.map((s, idx) => {
@@ -348,7 +340,7 @@ export default function SunsetPredictor(){
                           </tr>
                         </thead>
                         <tbody>
-                          {s.explain.items.map((it)=>(
+                          {s.explain.items.map((it)=> (
                             <tr key={it.key} className="border-t">
                               <td className="py-1 pr-3">{it.label}</td>
                               <td className="py-1 pr-3">{it.s.toFixed(2)}</td>
