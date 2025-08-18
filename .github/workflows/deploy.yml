@@ -2,7 +2,7 @@ name: Deploy Astro site to GitHub Pages
 
 on:
   push:
-    branches: [ main ]   # 你的默认分支；若是 master 就改成 master
+    branches: [ main ]      # 如果你的默认分支是 master，这里改成 master
   workflow_dispatch:
 
 permissions:
@@ -24,7 +24,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'     # Astro 5/React 19 兼容的 LTS；或 20/18 也可
+          node-version: '22'
           cache: 'npm'
 
       - name: Install deps
@@ -33,7 +33,7 @@ jobs:
       - name: Build
         run: npm run build
         env:
-          NODE_ENV: production
+          NODE_ENV: production   # 👈 关键：让 astro.config 走生产分支
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
@@ -50,3 +50,4 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+

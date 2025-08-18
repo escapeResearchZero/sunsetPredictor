@@ -89,31 +89,60 @@ export default function SunsetPredictor(){
   const [place,setPlace] = useState<string>("");
   const [openDetail, setOpenDetail] = useState<number|null>(null);
 
-  // Geolocate
+  // Geolocate (初次加载；失败则默认到 Lausanne，并尝试反查英文地名)
   useEffect(()=>{
     if(navigator.geolocation){
       navigator.geolocation.getCurrentPosition(
-        (p)=>{ setLat(p.coords.latitude); setLon(p.coords.longitude); fetchPlaceName(p.coords.latitude, p.coords.longitude); },
-        ()=>{ setLat(46.5197); setLon(6.6323); }
+        (p)=>{
+          setLat(p.coords.latitude);
+          setLon(p.coords.longitude);
+          fetchPlaceName(p.coords.latitude, p.coords.longitude);
+        },
+        ()=>{
+          const la = 46.5197, lo = 6.6323;
+          setLat(la); setLon(lo);
+          fetchPlaceName(la, lo);
+        }
       );
-    } else { setLat(46.5197); setLon(6.6323); }
+    } else {
+      const la = 46.5197, lo = 6.6323;
+      setLat(la); setLon(lo);
+      fetchPlaceName(la, lo);
+    }
   },[]);
-  useEffect(()=>{ if(lat==null||lon==null) return; const id=setTimeout(()=>fetchPlaceName(lat,lon),300); return ()=>clearTimeout(id); },[lat,lon]);
 
-  async function fetchPlaceName(la:number, lo:number){
-    try{
-      const url = new URL("https://geocoding-api.open-meteo.com/v1/reverse");
-      url.searchParams.set("latitude", String(la));
-      url.searchParams.set("longitude", String(lo));
-      url.searchParams.set("language", "zh");
-      url.searchParams.set("format", "json");
-      const r = await fetch(url.toString());
-      const j = await r.json();
-      const first = j?.results?.[0];
-      if(first){ setPlace([first.name, first.admin1, first.country_code].filter(Boolean).join(" · ")); }
-      else setPlace("");
-    }catch{ setPlace(""); }
+  // 经纬度改变时，轻微防抖后查询英文地名；失败时用 "lat, lon" 兜底
+  useEffect(()=>{
+    if(lat==null||lon==null) return;
+    const id=setTimeout(()=>fetchPlaceName(lat,lon),300);
+    return ()=>clearTimeout(id);
+  },[lat,lon]);
+
+  async function fetchPlaceName(lat: number, lon: number): Promise<string> {
+  try {
+    const url = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`;
+    const res = await fetch(url);
+    if (!res.ok) throw new Error("Network response was not ok");
+    const data = await res.json();
+
+    // 优先用 city / locality，没有就回退到 subdivision / country
+    const place =
+      data.city ||
+      data.locality ||
+      data.principalSubdivision ||
+      data.countryName;
+
+    if (place) {
+      return place;
+    } else {
+      // 如果什么都没有，就返回坐标
+      return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
+    }
+  } catch (err) {
+    console.error("Reverse geocoding failed:", err);
+    return `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
   }
+}
 
   async function fetchForecast(){
     if(lat==null||lon==null) return;
@@ -241,7 +270,14 @@ export default function SunsetPredictor(){
             </div>
             <div className="p-3 rounded-2xl bg-white shadow-sm text-sm text-gray-600 flex flex-col gap-1 col-span-full">
               <div className="flex items-center gap-2"><Info className="w-4 h-4"/>{status || (tz ? `时区 / Timezone：${tz}` : "准备就绪 / Ready")}</div>
-              <div className="pl-6">位置 / Location：{place || "—（未知 / Unknown）"}</div>
+              <div className="pl-6">
+                位置 / Location：
+                {place
+                  ? place
+                  : (lat!=null && lon!=null)
+                    ? `${lat.toFixed(5)}, ${lon.toFixed(5)}`
+                    : "—（未知 / Unknown）"}
+              </div>
             </div>
           </div>
         </CardContent>
