@@ -1,0 +1,9 @@
+---
+import Layout from "../layouts/Layout.astro";
+import FeedbackBoardSupabase from "../components/FeedbackBoardSupabase.tsx";
+---
+<Layout title="留言板 | Sunset Predictor">
+  <div class="mx-auto max-w-screen-2xl px-4 py-8 space-y-6">
+    <FeedbackBoardSupabase client:load />
+  </div>
+</Layout>

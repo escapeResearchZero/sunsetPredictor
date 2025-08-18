@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from "react";
+
+import React, { useEffect, useMemo, useState, useRef } from "react";
 import { Card, CardContent } from "./ui/card";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
@@ -37,8 +38,40 @@ type SunsetItem = {
   explain: { items: ExplainRow[]; total: number; formula: string; };
 };
 
-const defaultWeights = { highCloud: 0.35, midCloud: 0.25, lowCloud: 0.15, precip: 0.10, visibility: 0.07, wind: 0.08, aerosol: 0.00 };
+/* ---------- Weights (已去掉 aerosol) ---------- */
+const defaultWeights = {
+  highCloud: 0.35,
+  midCloud: 0.25,
+  lowCloud: 0.15,
+  precip: 0.10,
+  visibility: 0.07,
+  wind: 0.08,
+};
 type Weights = typeof defaultWeights;
+
+/* ====== 评分模型（可调；已去掉 aod） ====== */
+type TriModel = { type:"tri"|"invTri"; m:number; w:number; color:string; unit:"%"|" m/s"|" km" };
+type ClampUpModel = { type:"clampUp"; threshold:number; full:number; color:string; unit:"%"|" m/s"|" km" };
+type ClampDownModel = { type:"clampDown"; min:number; max:number; color:string; unit:"%"|" m/s"|" km" };
+type ScoreModel = TriModel | ClampUpModel | ClampDownModel;
+
+type ScoreModels = {
+  high: TriModel;
+  mid: TriModel;
+  low: TriModel;      // tri (低云越低越好，理想=0)
+  pre: ClampDownModel;
+  vis: ClampUpModel;
+  wind: TriModel;
+};
+
+const defaultModels: ScoreModels = {
+  high: { type:"tri",    m:50, w:20, color:"#ef4444", unit:"%" },  // 高云：理想 50% ±20
+  mid:  { type:"tri",    m:40, w:20, color:"#f59e0b", unit:"%" },  // 中云：理想 40% ±20
+  low:  { type:"tri",    m:0,  w:20, color:"#3b82f6", unit:"%" },  // 低云：理想 0%（越低越好）
+  pre:  { type:"clampDown", min:0, max:100, color:"#22c55e", unit:"%" },     // 降水概率越小越好
+  vis:  { type:"clampUp",   threshold:5, full:15, color:"#a855f7", unit:" km" }, // 能见度>5km 线性增至15km满分
+  wind: { type:"tri",    m:4,  w:4,  color:"#0ea5e9", unit:" m/s" },
+};
 
 /* ---------- Utils ---------- */
 function clamp(x:number,a:number,b:number){ return Math.max(a, Math.min(b,x)); }
@@ -53,7 +86,7 @@ function scoreTheme(s:number){
   return{bg:"#f3f4f6",fg:"#6b7280",ring:"#e5e7eb"};
 }
 
-// 0–1 → 0–100 归一化（处理 open-meteo 可能返回 0–1 的百分比）
+// 0–1 → 0–100 归一化（open-meteo 有时给 0–1）
 function normalizePctArray(arr:(number|undefined)[]):number[]{
   const nums = arr.filter((v):v is number => typeof v==="number");
   if(!nums.length) return [];
@@ -75,6 +108,61 @@ function aggNumOverIndices(source:(number|undefined)[], idx:number[], map?:(n:nu
   return { avg: sum/vals.length, min: Math.min(...vals), max: Math.max(...vals) };
 }
 
+/* 根据模型求 s（0–1） */
+function scoreByModel(x:number|undefined, model:ScoreModel): number|undefined {
+  if(x==null || Number.isNaN(x)) return undefined;
+  switch(model.type){
+    case "tri":     return tri(x, model.m, model.w);
+    case "invTri":  return 1 - tri(x, model.m, model.w);
+    case "clampUp": return clamp((x - model.threshold)/(model.full - model.threshold), 0, 1);
+    case "clampDown": return 1 - clamp((x - model.min)/(model.max - model.min), 0, 1);
+  }
+}
+
+/* ---------- 可视化区间类型 ---------- */
+type Band = { min: number; max: number; center: number; color: string; unit: string };
+
+/* 由 scoreModels 推导柱状图目标区间（包含单位） */
+function bandFromModel(key: keyof ScoreModels, m: ScoreModels[keyof ScoreModels]): Band {
+  switch (m.type) {
+    case "tri":
+      return {
+        min: clamp(m.m - m.w, 0, key === "wind" ? 20 : 100),
+        max: clamp(m.m + m.w, 0, key === "wind" ? 20 : 100),
+        center: m.m,
+        color: m.color,
+        unit: m.unit,
+      };
+    case "invTri":
+      return {
+        min: 0,                             // 越低越好，展示 [0, m-w]
+        max: clamp(m.m - m.w, 0, 100),
+        center: 0,
+        color: m.color,
+        unit: m.unit,
+      };
+    case "clampUp":
+      return {
+        min: m.threshold,                   // 从 threshold 到 full 逐步满分
+        max: m.full,
+        center: m.full,
+        color: m.color,
+        unit: m.unit,
+      };
+    case "clampDown": {
+      // 越小越好：展示靠近 min 的一段目标区间（20% 范围）
+      const span = Math.max(0, (m.max - m.min) * 0.2);
+      return {
+        min: m.min,
+        max: m.min + span,
+        center: m.min,
+        color: m.color,
+        unit: m.unit,
+      };
+    }
+  }
+}
+
 /* ---------- Component ---------- */
 export default function SunsetPredictor(){
   const [lat,setLat] = useState<number|null>(null);
@@ -85,10 +173,17 @@ export default function SunsetPredictor(){
   const [data,setData] = useState<OpenMeteoResponse|null>(null);
   const [tz,setTz] = useState<string|null>(null);
   const [days,setDays] = useState(5);
-  const [weights] = useState<Weights>(defaultWeights);
+  const [weights, setWeights] = useState<Weights>(defaultWeights);
   const [status,setStatus] = useState("");
   const [windowMinutes,setWindowMinutes] = useState(90);
   const [openDetail, setOpenDetail] = useState<number|null>(null);
+
+  // 可调模型
+  const [scoreModels, setScoreModels] = useState<ScoreModels>(defaultModels);
+
+  // 导入/导出
+  const fileRef = useRef<HTMLInputElement|null>(null);
+  type ParamBundle = { version: 1; weights: Weights; models: ScoreModels };
 
   const canQuery = lat!=null && lon!=null;
 
@@ -108,9 +203,9 @@ export default function SunsetPredictor(){
 
   // ---- Geolocate once on mount (fallback Lausanne) ----
   function requestLocation(){
-    if (navigator.geolocation){
-      navigator.geolocation.getCurrentPosition(
-        (p)=>{
+    if (typeof navigator !== "undefined" && (navigator as any).geolocation){
+      (navigator as any).geolocation.getCurrentPosition(
+        (p:any)=>{
           const la = +p.coords.latitude.toFixed(5);
           const lo = +p.coords.longitude.toFixed(5);
           setLat(la); setLon(lo);
@@ -184,14 +279,13 @@ export default function SunsetPredictor(){
       const ccHigh=aggHigh.avg, ccMid=aggMid.avg, ccLow=aggLow.avg;
       const pPrecip=aggPrecip.avg, visKm=aggVisKm.avg, wind=aggWind.avg;
 
-      // === 标准化得分 s_i（0–1） ===
-      const sHigh = ccHigh==null?0.5:tri(ccHigh,50,40);
-      const sMid  = ccMid==null?0.5:tri(ccMid,40,35);
-      const sLow  = ccLow==null?0.5:1 - tri(ccLow,20,25);
-      const sPre  = pPrecip==null?0.6:1 - clamp(pPrecip/100,0,1);
-      const sVis  = visKm==null?0.6:clamp((visKm-5)/10,0,1);
-      const sWind = wind==null?0.6:tri(wind,4,4);
-      const sAod  = 0.6;
+      // s_i（0–1）—— 使用 *可调* 模型 scoreModels（实时联动）
+      const sHigh = scoreByModel(ccHigh, scoreModels.high) ?? 0.5;
+      const sMid  = scoreByModel(ccMid,  scoreModels.mid ) ?? 0.5;
+      const sLow  = scoreByModel(ccLow,  scoreModels.low ) ?? 0.5;
+      const sPre  = scoreByModel(pPrecip,scoreModels.pre ) ?? 0.6;
+      const sVis  = scoreByModel(visKm,  scoreModels.vis ) ?? 0.6;
+      const sWind = scoreByModel(wind,   scoreModels.wind) ?? 0.6;
 
       const w=weights;
       const parts = [
@@ -201,7 +295,6 @@ export default function SunsetPredictor(){
         { key:"pre",  label:"Precip prob / 降水概率",      s:sPre,  w:w.precip,     note: pPrecip==null? "No data / 无数据" : undefined },
         { key:"vis",  label:"Visibility / 能见度",         s:sVis,  w:w.visibility, note: visKm==null  ? "No data / 无数据" : undefined },
         { key:"wind", label:"Wind / 风速",                 s:sWind, w:w.wind,       note: wind==null   ? "No data / 无数据" : undefined },
-        { key:"aod",  label:"Aerosol / 气溶胶(占位)",      s:sAod,  w:w.aerosol,    note: "Not wired yet / 暂未接入" },
       ].map(it => ({ ...it, contribution: Math.round(it.s * it.w * 1000)/10 }));
 
       const score0 = parts.reduce((acc,it)=>acc+it.contribution,0);
@@ -216,7 +309,154 @@ export default function SunsetPredictor(){
       });
     }
     return out;
-  },[data,lat,lon,days,weights,windowMinutes]);
+  // ⭐ 关键：加入 scoreModels 作为依赖，保证拖动参数/导入文件后实时更新分数与细节
+  },[data,lat,lon,days,weights,windowMinutes,scoreModels]);
+
+  /* ===== 导出 / 导入参数（权重 + 模型） ===== */
+  function exportParams(){
+    const bundle = { version: 1 as const, weights, models: scoreModels };
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `sunsetpredictor-params-v1.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+  async function importParams(file: File){
+    try{
+      const text = await file.text();
+      const json = JSON.parse(text);
+      // 轻量校验
+      if (json?.version !== 1 || !json?.weights || !json?.models) throw new Error("文件结构不符合 v1 参数格式");
+      const w = json.weights as Weights;
+      const m = json.models as ScoreModels;
+      // 关键字段存在性检查
+      const wk = ["highCloud","midCloud","lowCloud","precip","visibility","wind"];
+      if (!wk.every(k => typeof (w as any)[k] === "number")) throw new Error("weights 字段缺失或类型错误");
+      const mk = ["high","mid","low","pre","vis","wind"];
+      if (!mk.every(k => m[k as keyof ScoreModels])) throw new Error("models 字段缺失");
+      setWeights(w);
+      setScoreModels(m);
+      alert("参数已导入并生效。");
+    }catch(e:any){
+      alert(`导入失败：${e?.message || e}`);
+    }finally{
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  }
+
+  /* UI：权重 + 模型参数折叠面板（含导入/导出） */
+  function WeightsAndModelsPanel(){
+    const sum = (Object.values(weights) as number[]).reduce((a,b)=>a+b,0);
+  
+    return (
+      <div className="grid gap-4">
+        {/* —— 权重 —— */}
+        <CollapsibleSection
+          title="Weights (click to fold) / 权重 (点击收起)"
+          hint={`当前合计：${sum.toFixed(2)} · 建议≈1.00`}
+          storageKey="panel.weights"
+          defaultOpen
+        >
+          <WeightRow label="High cloud 高云" value={weights.highCloud} onChange={v=>setWeights({...weights, highCloud:v})}/>
+          <WeightRow label="Mid cloud 中云"  value={weights.midCloud}  onChange={v=>setWeights({...weights, midCloud:v})}/>
+          <WeightRow label="Low cloud 低云"  value={weights.lowCloud}  onChange={v=>setWeights({...weights, lowCloud:v})}/>
+          <WeightRow label="Precip 降水概率"   value={weights.precip}    onChange={v=>setWeights({...weights, precip:v})}/>
+          <WeightRow label="Visibility 能见度" value={weights.visibility} onChange={v=>setWeights({...weights, visibility:v})}/>
+          <WeightRow label="Wind 风速"        value={weights.wind}       onChange={v=>setWeights({...weights, wind:v})}/>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="secondary" onClick={()=>setWeights(defaultWeights)}>恢复默认权重</Button>
+            <Button variant="secondary" onClick={()=>{
+              const total = (Object.values(weights) as number[]).reduce((a,b)=>a+b,0) || 1;
+              const scaled = Object.fromEntries(Object.entries(weights).map(([k,v])=>[k, v/total])) as typeof weights;
+              setWeights(scaled);
+            }}>归一化为 1.00</Button>
+          </div>
+        </CollapsibleSection>
+  
+        {/* —— 三角模型：高/中/低云 + 风 —— */}
+        <CollapsibleSection
+          title="Clouds & Wind（三角模型）"
+          storageKey="panel.tri"
+          defaultOpen={false}
+        >
+          <TriRow
+            name="High / 高云"
+            m={scoreModels.high.m} w={scoreModels.high.w} color={scoreModels.high.color} unit="%"
+            mRange={[0,100]} wRange={[0,60]}
+            onChange={(m,w)=>setScoreModels({...scoreModels, high:{...scoreModels.high, m,w}})}
+          />
+          <TriRow
+            name="Mid / 中云"
+            m={scoreModels.mid.m} w={scoreModels.mid.w} color={scoreModels.mid.color} unit="%"
+            mRange={[0,100]} wRange={[0,60]}
+            onChange={(m,w)=>setScoreModels({...scoreModels, mid:{...scoreModels.mid, m,w}})}
+          />
+          <TriRow
+            name="Low / 低云（理想越低越好）"
+            m={scoreModels.low.m} w={scoreModels.low.w} color={scoreModels.low.color} unit="%"
+            mRange={[0,100]} wRange={[0,60]}
+            onChange={(m,w)=>setScoreModels({...scoreModels, low:{...scoreModels.low, m,w}})}
+          />
+          <TriRow
+            name="Wind / 风速"
+            m={scoreModels.wind.m} w={scoreModels.wind.w} color={scoreModels.wind.color} unit=" m/s"
+            mRange={[0,20]} wRange={[0,10]}
+            onChange={(m,w)=>setScoreModels({...scoreModels, wind:{...scoreModels.wind, m,w}})}
+          />
+        </CollapsibleSection>
+  
+        {/* —— 阈值模型：降水 + 能见度 —— */}
+        <CollapsibleSection
+          title="Precip & Visibility（阈值模型）"
+          storageKey="panel.thresholds"
+          defaultOpen={false}
+        >
+          <ClampDownRow
+            name="Precip / 降水概率（越小越好）"
+            min={scoreModels.pre.min} max={scoreModels.pre.max} unit="%"
+            minRange={[0,100]} maxRange={[0,100]}
+            onChange={(min,max)=>setScoreModels({...scoreModels, pre:{...scoreModels.pre, min, max}})}
+          />
+          <ClampUpRow
+            name="Visibility / 能见度（高于阈值逐步满分）"
+            threshold={scoreModels.vis.threshold} full={scoreModels.vis.full} unit=" km"
+            thrRange={[0,30]} fullRange={[1,100]}
+            onChange={(thr,full)=>setScoreModels({...scoreModels, vis:{...scoreModels.vis, threshold:thr, full}})}
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button onClick={exportParams}>导出参数 (JSON)</Button>
+            <input
+              ref={fileRef}
+              type="file"
+              accept="application/json"
+              className="hidden"
+              onChange={(e)=>{ const f = e.target.files?.[0]; if(f) importParams(f); }}
+            />
+            <Button variant="secondary" onClick={()=>fileRef.current?.click()}>导入参数 (JSON)</Button>
+            <Button variant="secondary" onClick={()=>{
+              setWeights(defaultWeights);
+              setScoreModels(defaultModels);
+            }}>恢复默认模型与权重</Button>
+          </div>
+        </CollapsibleSection>
+      </div>
+    );
+  }
+  
+
+  /* 计算所有因子的 band（含单位）供 Bar 使用 */
+  const bandsAll: Record<string, Band> = useMemo(()=>({
+    high: bandFromModel("high", scoreModels.high),
+    mid:  bandFromModel("mid",  scoreModels.mid),
+    low:  bandFromModel("low",  scoreModels.low),
+    pre:  bandFromModel("pre",  scoreModels.pre),
+    vis:  bandFromModel("vis",  scoreModels.vis),
+    wind: bandFromModel("wind", scoreModels.wind),
+  }), [scoreModels]);
 
   return (
     <div className="container mx-auto px-4">
@@ -235,7 +475,7 @@ export default function SunsetPredictor(){
           {/* 顶部：自动定位提示 + 重新定位按钮 */}
           <div className="flex items-center justify-between text-sm text-gray-600">
             <div>
-              位置 / Location：{place ?? (lat!=null && lon!=null ? `${lat.toFixed(5)}, ${lon.toFixed(5)}` : "—")}
+              位置 / Location：{place ?? (lat!=null && lon!=null ? `${lat.toFixed(5)}, ${lon?.toFixed(5)}` : "—")}
             </div>
             <Button onClick={requestLocation} variant="secondary" className="gap-2">
               <LocateFixed className="w-4 h-4"/> 重新定位
@@ -271,6 +511,11 @@ export default function SunsetPredictor(){
             <div className="p-3 rounded-2xl bg-white shadow-sm text-sm text-gray-600 flex flex-col gap-1 col-span-full">
               <div className="flex items-center gap-2"><Info className="w-4 h-4"/>{(tz && `时区 / Timezone：${tz}`) || "准备就绪 / Ready"}</div>
             </div>
+
+            {/* 参数折叠面板 */}
+            <div className="col-span-full">
+              {WeightsAndModelsPanel()}
+            </div>
           </div>
         </CardContent>
       </Card>
@@ -303,18 +548,27 @@ export default function SunsetPredictor(){
                   </div>
                 </div>
 
-                {/* 主体：左侧三色圆环 + 右侧指标卡片 */}
-                <div className="grid grid-cols-[180px_1fr] gap-6 items-center">
-                  <CloudDonut size={180} high={s.highPct??0} mid={s.midPct??0} low={s.lowPct??0} />
+                {/* 顶部横向柱状图：显示所有因子（无 aod） */}
+                <CloudBars
+                  values={{
+                    high: s.highPct ?? 0,           // %
+                    mid:  s.midPct ?? 0,            // %
+                    low:  s.lowPct ?? 0,            // %
+                    pre:  s.aggPrecip.avg ?? 0,     // %
+                    vis:  s.aggVisKm.avg ?? 0,      // km
+                    wind: s.aggWind.avg ?? 0,       // m/s
+                  }}
+                  bands={bandsAll}
+                />
 
-                  <div className="grid grid-cols-1 gap-3 text-sm">
-                    <StatCard title="High cloud / 高云"   agg={s.aggHigh}   unit="%" />
-                    <StatCard title="Mid cloud / 中云"    agg={s.aggMid}    unit="%" />
-                    <StatCard title="Low cloud / 低云"    agg={s.aggLow}    unit="%" />
-                    <StatCard title="Precip prob / 降水概率" agg={s.aggPrecip} unit="%" />
-                    <StatCard title="Visibility / 能见度"  agg={s.aggVisKm} unit=" km" />
-                    <StatCard title="Wind / 风速"          agg={s.aggWind}  unit=" m/s" />
-                  </div>
+                {/* 指标卡片：在小屏单列，大屏两列 */}
+                <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+                  <StatCard title="High cloud / 高云"   agg={s.aggHigh}   unit="%" />
+                  <StatCard title="Mid cloud / 中云"    agg={s.aggMid}    unit="%" />
+                  <StatCard title="Low cloud / 低云"    agg={s.aggLow}    unit="%" />
+                  <StatCard title="Precip prob / 降水概率" agg={s.aggPrecip} unit="%" />
+                  <StatCard title="Visibility / 能见度"  agg={s.aggVisKm} unit=" km" />
+                  <StatCard title="Wind / 风速"          agg={s.aggWind}  unit=" m/s" />
                 </div>
 
                 {/* 计算细节：按钮 + 折叠 */}
@@ -382,33 +636,233 @@ function StatCard({ title, agg, unit }:{ title:string; agg:StatAgg; unit:string;
   );
 }
 
-/* 多环圆环图（高/中/低云；百分比越大弧越长） */
-function CloudDonut({ high, mid, low, size=180 }:{ high:number; mid:number; low:number; size?:number }){
-  const cx=size/2, cy=size/2;
-  const rings = [
-    { val: clamp(high,0,100), r: size*0.42, color:"#ef4444", label:"H" },
-    { val: clamp(mid ,0,100), r: size*0.30, color:"#f59e0b", label:"M" },
-    { val: clamp(low ,0,100), r: size*0.18, color:"#3b82f6", label:"L" },
-  ];
+function CollapsibleSection({
+  title, hint, storageKey, defaultOpen = false, children
+}:{
+  title: string;
+  hint?: string;
+  storageKey: string;         // 记忆展开状态的 key
+  defaultOpen?: boolean;
+  children: React.ReactNode;
+}){
+  const [open, setOpen] = React.useState<boolean>(defaultOpen);
+
+  // 客户端挂载后再恢复本地状态
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const saved = window.localStorage.getItem(storageKey);
+      if (saved != null) setOpen(saved === "1");
+    } catch {}
+  }, [storageKey]);
+
+  // 状态变更后再写回本地
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(storageKey, open ? "1" : "0");
+    } catch {}
+  }, [open, storageKey]);
+
   return (
-    <div className="flex flex-col items-center gap-2">
-      <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
-        {rings.map((k,i)=>{
-          const c=2*Math.PI*k.r; const dash=(k.val/100)*c;
-          return (
-            <g key={i} transform={`rotate(-90 ${cx} ${cy})`}>
-              <circle cx={cx} cy={cy} r={k.r} fill="none" stroke="#f1f5f9" strokeWidth={size*0.08}/>
-              <circle cx={cx} cy={cy} r={k.r} fill="none" stroke={k.color} strokeWidth={size*0.08} strokeLinecap="round"
-                strokeDasharray={`${dash} ${c-dash}`} />
-            </g>
-          );
-        })}
-        {/* 中央文本 */}
-        <text x={cx} y={cy-8} textAnchor="middle" fontSize={12} fill="#ef4444">H {Math.round(high)}%</text>
-        <text x={cx} y={cy+6}  textAnchor="middle" fontSize={12} fill="#f59e0b">M {Math.round(mid)}%</text>
-        <text x={cx} y={cy+20} textAnchor="middle" fontSize={12} fill="#3b82f6">L {Math.round(low)}%</text>
-      </svg>
+    <details
+      className="rounded-2xl bg-white/70 border border-gray-100 p-3"
+      open={open}
+      onToggle={(e)=>setOpen((e.target as HTMLDetailsElement).open)}
+    >
+      <summary className="cursor-pointer select-none flex items-center justify-between">
+        <span className="text-sm font-medium text-gray-800">{title}</span>
+        {hint && <span className="text-xs text-gray-500">{hint}</span>}
+      </summary>
+      <div className="mt-3 grid gap-3">{children}</div>
+    </details>
+  );
+}
+
+
+function WeightRow({label, value, onChange}:{label:string; value:number; onChange:(v:number)=>void}){
+  return (
+    <div className="grid grid-cols-12 items-center gap-2">
+      <div className="col-span-4 text-xs text-gray-700">{label}</div>
+      <div className="col-span-6">
+        <Slider value={[value]} min={0} max={1} step={0.01} onValueChange={(v)=>onChange(+v[0])}/>
+      </div>
+      <div className="col-span-2">
+        <Input type="number" step="0.01" value={value} onChange={(e)=>onChange(parseFloat(e.target.value||"0"))}/>
+      </div>
     </div>
   );
 }
 
+function TriRow({
+  name, m, w, color, unit, mRange, wRange, onChange
+}:{
+  name:string; m:number; w:number; color:string; unit:string;
+  mRange:[number,number]; wRange:[number,number];
+  onChange:(m:number,w:number)=>void;
+}){
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between text-xs text-gray-700">
+        <div className="flex items-center gap-2">
+          <span className="inline-flex h-2 w-2 rounded-full" style={{background:color}} />
+          <span>{name}</span>
+        </div>
+        <div className="text-[11px] text-gray-500">ideal={m}{unit} · tolerance={w}{unit}</div>
+      </div>
+      <div className="grid grid-cols-12 items-center gap-2">
+        <div className="col-span-2 text-[11px] text-gray-600">ideal</div>
+        <div className="col-span-8"><Slider value={[m]} min={mRange[0]} max={mRange[1]} step={1} onValueChange={(v)=>onChange(+v[0], w)}/></div>
+        <div className="col-span-2"><Input type="number" value={m} onChange={(e)=>onChange(parseFloat(e.target.value||"0"), w)}/></div>
+      </div>
+      <div className="grid grid-cols-12 items-center gap-2">
+        <div className="col-span-2 text-[11px] text-gray-600">tolerance</div>
+        <div className="col-span-8"><Slider value={[w]} min={wRange[0]} max={wRange[1]} step={1} onValueChange={(v)=>onChange(m, +v[0])}/></div>
+        <div className="col-span-2"><Input type="number" value={w} onChange={(e)=>onChange(m, parseFloat(e.target.value||"0"))}/></div>
+      </div>
+    </div>
+  );
+}
+
+function ClampDownRow({
+  name, min, max, unit, minRange, maxRange, onChange
+}:{
+  name:string; min:number; max:number; unit:string;
+  minRange:[number,number]; maxRange:[number,number];
+  onChange:(min:number,max:number)=>void;
+}){
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between text-xs text-gray-700">
+        <div>{name}</div>
+        <div className="text-[11px] text-gray-500">min={min}{unit} · max={max}{unit}</div>
+      </div>
+      <div className="grid grid-cols-12 items-center gap-2">
+        <div className="col-span-2 text-[11px] text-gray-600">min</div>
+        <div className="col-span-8"><Slider value={[min]} min={minRange[0]} max={minRange[1]} step={1} onValueChange={(v)=>onChange(+v[0], max)}/></div>
+        <div className="col-span-2"><Input type="number" value={min} onChange={(e)=>onChange(parseFloat(e.target.value||"0"), max)}/></div>
+      </div>
+      <div className="grid grid-cols-12 items-center gap-2">
+        <div className="col-span-2 text-[11px] text-gray-600">max</div>
+        <div className="col-span-8"><Slider value={[max]} min={maxRange[0]} max={maxRange[1]} step={1} onValueChange={(v)=>onChange(min, +v[0])}/></div>
+        <div className="col-span-2"><Input type="number" value={max} onChange={(e)=>onChange(min, parseFloat(e.target.value||"0"))}/></div>
+      </div>
+    </div>
+  );
+}
+
+function ClampUpRow({
+  name, threshold, full, unit, thrRange, fullRange, onChange
+}:{
+  name:string; threshold:number; full:number; unit:string;
+  thrRange:[number,number]; fullRange:[number,number];
+  onChange:(threshold:number, full:number)=>void;
+}){
+  return (
+    <div className="grid gap-2">
+      <div className="flex items-center justify-between text-xs text-gray-700">
+        <div>{name}</div>
+        <div className="text-[11px] text-gray-500">threshold={threshold}{unit} · full={full}{unit}</div>
+      </div>
+      <div className="grid grid-cols-12 items-center gap-2">
+        <div className="col-span-2 text-[11px] text-gray-600">threshold</div>
+        <div className="col-span-8"><Slider value={[threshold]} min={thrRange[0]} max={thrRange[1]} step={1} onValueChange={(v)=>onChange(+v[0], full)}/></div>
+        <div className="col-span-2"><Input type="number" value={threshold} onChange={(e)=>onChange(parseFloat(e.target.value||"0"), full)}/></div>
+      </div>
+      <div className="grid grid-cols-12 items-center gap-2">
+        <div className="col-span-2 text-[11px] text-gray-600">full</div>
+        <div className="col-span-8"><Slider value={[full]} min={fullRange[0]} max={fullRange[1]} step={1} onValueChange={(v)=>onChange(threshold, +v[0])}/></div>
+        <div className="col-span-2"><Input type="number" value={full} onChange={(e)=>onChange(threshold, parseFloat(e.target.value||"0"))}/></div>
+      </div>
+    </div>
+  );
+}
+
+/* 全部因子横向柱状图（灰带→柱→理想线；按单位归一） */
+// 固定坐标轴范围，避免不同单位导致柱宽不一致
+const FIXED_DOMAINS: Record<string, [number, number]> = {
+  high: [0, 100],   // %
+  mid:  [0, 100],   // %
+  low:  [0, 100],   // %
+  pre:  [0, 100],   // 降水概率 %
+  vis:  [0, 40],    // km（可按需调整，如 0–30/50）
+  wind: [0, 20],    // m/s
+};
+
+function CloudBars({
+  values,
+  bands
+}:{
+  values: Record<string, number>;
+  bands: Record<string, Band>;
+}){
+  const items = [
+    { key:"high", label:"High / 高云" },
+    { key:"mid",  label:"Mid / 中云" },
+    { key:"low",  label:"Low / 低云" },
+    { key:"pre",  label:"Precip / 降水概率" },
+    { key:"vis",  label:"Visibility / 能见度" },
+    { key:"wind", label:"Wind / 风速" },
+  ] as const;
+
+  const fmt = (val:number, unit:string)=>{
+    if(unit.trim()==="%") return `${Math.round(val)}%`;
+    if(unit.includes("km")) return `${Math.round(val)} km`;
+    if(unit.includes("m/s")) return `${Math.round(val)} m/s`;
+    return `${Math.round(val)}${unit}`;
+  };
+
+  return (
+    <div className="w-full rounded-2xl border border-gray-100 bg-white/70 p-3">
+      <div className="mb-2 text-sm font-medium text-gray-800">
+        All factors around sunset / 日落窗所有因子
+      </div>
+      <div className="space-y-3">
+        {items.map(item=>{
+
+          const vRaw = values[item.key] ?? 0;
+          const band = bands[item.key];
+          const domain = FIXED_DOMAINS[item.key] || [0,100];
+          const toPct = (val:number)=> {
+            const [d0,d1] = domain;
+            const p = ((val - d0) / Math.max(1e-6, (d1 - d0))) * 100;
+            return Math.max(0, Math.min(100, p));
+          };
+
+          const bandLeft  = `${toPct(band.min)}%`;
+          const bandRight = toPct(band.max);
+          const bandWidth = `${Math.max(0, bandRight - toPct(band.min))}%`;
+          const markerLeft= `${toPct(band.center)}%`;
+
+          const widthPct  = toPct(vRaw);
+          return (
+            <div key={item.key}>
+              <div className="mb-1 flex items-center justify-between text-xs text-gray-600">
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex h-2 w-2 rounded-full" style={{ background: band.color }} />
+                  {item.label}
+                </div>
+                <div className="tabular-nums">
+                  {fmt(vRaw, band.unit)}
+                  <span className="text-gray-400"> · 目标 {fmt(band.min, band.unit)}–{fmt(band.max, band.unit)}</span>
+                </div>
+              </div>
+
+              <div className="relative h-3 w-full rounded-full bg-gray-100 overflow-hidden">
+                {/* 目标区间（底层） */}
+                <div className="absolute top-0 bottom-0 rounded-full"
+                     style={{ left: bandLeft, width: bandWidth, background: "rgba(0,0,0,0.06)" }} />
+                {/* 彩色柱（中层） */}
+                <div className="absolute top-0 bottom-0 rounded-full"
+                     style={{ width: `${widthPct}%`, background: band.color, transition: "width 300ms ease" }} />
+                {/* 理想点（最上层） */}
+                <div className="absolute top-[-2px] bottom-[-2px] w-[2px] bg-gray-800"
+                     style={{ left: markerLeft }} title={`理想值 ${fmt(band.center, band.unit)}`} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
