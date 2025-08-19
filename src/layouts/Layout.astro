@@ -1,5 +1,7 @@
 ---
 const { title } = Astro.props;
+const isProd = import.meta.env.PROD;                       // 生产环境？
+const isVercel = typeof process !== 'undefined' && !!process.env.VERCEL; // 在 Vercel 上构建？;
 ---
 <html lang="en">
   <head>
