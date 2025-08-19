@@ -2,6 +2,7 @@ import { defineConfig } from 'astro/config';
 import tailwind from '@astrojs/tailwind';
 import react from '@astrojs/react';
 
+
 // Multi-target config: GitHub Pages (subpath) and Vercel (root)
 const isProd = process.env.NODE_ENV === 'production';
 const isVercel = !!process.env.VERCEL;              // Vercel sets this env automatically
