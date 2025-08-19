@@ -3,7 +3,7 @@
   "buildCommand": "npm run build",
   "outputDirectory": "dist",
   "cleanUrls": true,
-  "trailingSlash": "never",
+  "trailingSlash": false,
   "headers": [
     {
       "source": "/(.*)\\.(css|js|png|svg|webp|jpg)",
