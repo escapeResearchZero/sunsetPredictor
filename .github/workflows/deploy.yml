@@ -2,7 +2,7 @@ name: Deploy Astro site to GitHub Pages
 
 on:
   push:
-    branches: [ main ]      # 如果你的默认分支是 master，这里改成 master
+    branches: [ main ]
   workflow_dispatch:
 
 permissions:
@@ -24,16 +24,18 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
-          cache: 'npm'
+          node-version: 20
 
-      - name: Install deps
+      - name: Install dependencies
         run: npm ci
 
       - name: Build
         run: npm run build
         env:
-          NODE_ENV: production   # 👈 关键：让 astro.config 走生产分支
+          NODE_ENV: production
+          # Make Astro generate URLs and assets for GitHub Pages subpath
+          VERCEL: ""                # make sure isVercel=false
+          SITE_URL: https://escapeResearchZero.github.io/sunsetPredictor/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
@@ -50,4 +52,3 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
